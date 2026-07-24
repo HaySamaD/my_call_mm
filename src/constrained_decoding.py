@@ -5,20 +5,13 @@ from typing import Any, Optional, Set
 
 
 class JsonConstrainedDecoder:
-    """
-    Finite State Machine vocabulary decoder designed
-    to mask illegal probability logits
-    and isolate character strings over active parsing loops.
-    """
+    """Finite State Machine decoder for valid JSON logits generation."""
 
     def __init__(self,
                  vocab: dict,
                  valid_function_names: Optional[list[str]] = None
                  ) -> None:
-        """
-        Prepares internal state parameters, constants, tracking metrics,
-        and arrays.
-        """
+        # Initialize internal vocabulary, function names, and mask ceiling.
         self.vocab = vocab
         self.actual_function_names = (
             ["none"] if valid_function_names is None else list(
@@ -28,14 +21,12 @@ class JsonConstrainedDecoder:
         self.mask_ceiling = -100000.0
 
     def get_approve_valid_token(self, logits: Any, current_text: str) -> int:
-        """
-        Computes structural status configurations
-        and selects the next type-safe token.
-        """
+        # Determine string state, filter valid tokens, and return top logit.
         logits_array = np.array(logits, dtype=np.float32)
         masked_logits = np.full_like(logits_array, self.mask_ceiling)
 
-        unescaped_quotes = current_text.count('"') - current_text.count('\\"')
+        unescaped_quotes = (current_text.count('"') -
+                            current_text.count('\\"'))
         is_inside_string = (unescaped_quotes % 2 == 1)
         stripped = current_text.strip()
         valid_ids: list[int] = []
@@ -57,10 +48,7 @@ class JsonConstrainedDecoder:
                                     current_text: str,
                                     stripped: str
                                     ) -> list[int]:
-        """
-        Filters tokens while the decoder
-        is processing content nested inside string literal states.
-        """
+        # Filter allowed tokens while generating text inside JSON strings.
         valid_ids = []
         is_writing_name_value = stripped.endswith(
             '"name":') or ('"name":' in stripped and '"args"' not in stripped)
@@ -96,10 +84,7 @@ class JsonConstrainedDecoder:
                                      current_text: str,
                                      stripped: str
                                      ) -> list[int]:
-        """
-        Enforces schema rules
-        and syntax structure borders when outside a string value block.
-        """
+        # Enforce structural rules and JSON syntax outside string values.
         valid_ids = []
         if not current_text:
             return [
@@ -161,17 +146,12 @@ class JsonConstrainedDecoder:
 
     @staticmethod
     def build_json_valid_ids(vocab: dict) -> Set[int]:
-        """
-        Maps target indices across vocabulary parameters.
-        """
+        # Extract and return the complete set of valid vocabulary IDs.
         return set(vocab.values())
 
     @staticmethod
     def extract_complete_json(text: str) -> Optional[str]:
-        """
-        Slices and verifies completely bounded brace blocks
-        to terminate text streams early.
-        """
+        # Extract the first complete valid JSON object from the input string.
         start = text.find("{")
         if start == -1:
             return None
@@ -187,10 +167,7 @@ class JsonConstrainedDecoder:
 
     @staticmethod
     def build_system_prompt(functions: Any) -> str:
-        """
-        Formats definitions and instruction properties
-        into systemic context boundaries.
-        """
+        # Construct the system instruction prompt with available functions.
         lines = [
             "STRICT SYSTEM RULE: Use ONLY a matching function "
             "from the list below.",
@@ -210,7 +187,7 @@ class JsonConstrainedDecoder:
 
 
 def load_vocabulary(model: Small_LLM_Model) -> Any:
-    """Parses local configuration tokens from downstream JSON files."""
+    # Load and extract vocabulary dictionary from the model tokenizer file.
     vocab_path = model.get_path_to_tokenizer_file()
     with open(vocab_path, 'r', encoding="utf-8") as f:
         toke_data = json.load(f)

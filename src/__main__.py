@@ -13,45 +13,53 @@ console = Console()
 
 
 class ConstrainedDecodingApp:
-    """
-    Main orchestration class for loading dependencies and handling the
+    """Main orchestration class for loading dependencies and handling the
     constrained text decoding execution pipeline.
     """
 
     def __init__(self, args: argparse.Namespace) -> None:
+        """Initializes components, loads schemas, test prompts, and compiles
+        parameters.
         """
-        Initializes components, loads schemas,
-        test prompts, and compiles parameters.
-        """
+        # Store CLI arguments and instantiate the language model.
         self.args = args
         self.model = Small_LLM_Model(model_name=args.model)
+
+        # Load tool schemas and input prompts from specified files.
         self.functions = load_function_definitions(args.functions_definition)
         self.prompts = load_test_prompts(args.input)
         self.max_tokens = args.max_tokens
+
+        # Ensure essential input files are loaded properly.
         if not self.functions or not self.prompts:
             raise RuntimeError("Initialization files are empty or missing.")
+
+        # Build system prompt context for function calling rules.
         self.system_prompt = JsonConstrainedDecoder.build_system_prompt(
             self.functions)
+
+        # Load tokenizer vocabulary and map valid function names.
         vocab = load_vocabulary(self.model)
         valid_names = [fn.name for fn in self.functions]
         self.decoder = JsonConstrainedDecoder(
             vocab=vocab, valid_function_names=valid_names)
 
     def execute_pipeline(self) -> None:
-        """
-        Iterates through the testing prompts
-        and performs state-constrained sampling loops.
+        """Iterates through the testing prompts and performs state-constrained
+        sampling loops.
         """
         console.print("\n[bold yellow]Processing prompts...[/bold yellow]\n")
         all_results = []
         start_time = time.time()
 
+        # Iterate over all user test prompts sequentially.
         for index, p in enumerate(self.prompts, 1):
             prompt = p.prompt
             console.print(
                 f"[bold cyan]Processing prompt {index}/{len(self.prompts)}:"
                 f"[/bold cyan] {prompt}")
 
+            # Construct full context and initialize decoding state with prefix.
             full_prompt = (
                 f"{self.system_prompt}\n\nUser prompt: {prompt}\nAssistant:")
             generated_ids = self.model.encode(full_prompt)[0].tolist()
@@ -62,7 +70,9 @@ class ConstrainedDecodingApp:
             print("  -> Generating: ", end="", flush=True)
             print('{"name": "', end="", flush=True)
 
+            # Token generation loop with constrained decoding.
             while True:
+                # Prevent infinite generation loops by enforcing token limits.
                 if token_count >= self.max_tokens:
                     console.print("\n  -> [bold red][Error] Maximum "
                                   "token limit reached (Loop safety "
@@ -73,6 +83,7 @@ class ConstrainedDecodingApp:
                 logits = self.model.get_logits_from_input_ids(
                     generated_ids + all_generated)
 
+                # Filter logits via FSM decoder to pick valid token ID.
                 next_id = self.decoder.get_approve_valid_token(
                     logits, current_text)
                 all_generated.append(next_id)
@@ -80,6 +91,7 @@ class ConstrainedDecodingApp:
 
                 print(self.model.decode([next_id]), end="", flush=True)
 
+                # Attempt to extract a valid bounded JSON block from stream.
                 text = self.model.decode(all_generated)
                 clean_json = JsonConstrainedDecoder.extract_complete_json(text)
                 if clean_json:
@@ -90,6 +102,7 @@ class ConstrainedDecodingApp:
                         pass
             print()
 
+            # Display status based on parsed function call outcome.
             if parsed.get("name", "none") != "none":
                 escaped_args = escape(str(parsed['args']))
                 console.print("  -> [bold green]✔ Success:[/bold green] "
@@ -99,6 +112,7 @@ class ConstrainedDecodingApp:
                               "function call[/bold red]")
             print()
 
+            # Cast extracted arguments and parse according to schema types.
             extracted_args = cast(dict[Any, Any], parsed.get("args", {}))
             cleaned_parameters: dict[str, Any] = {}
 
@@ -106,6 +120,7 @@ class ConstrainedDecodingApp:
                 fn for fn in self.functions if fn.name == parsed.get("name")),
                 None)
 
+            # Validate parameter keys and convert values to expected types.
             for key, value in extracted_args.items():
                 if current_fn_def and key not in current_fn_def.parameters:
                     continue
@@ -127,22 +142,24 @@ class ConstrainedDecodingApp:
                 else:
                     cleaned_parameters[key] = value
 
+            # Append current prompt evaluation result.
             all_results.append({
                 "prompt": prompt,
                 "name": parsed.get("name", "none"),
                 "parameters": cleaned_parameters
             })
 
+        # Save aggregated pipeline execution results to disk.
         self._save_results(all_results, time.time() - start_time)
 
     def _save_results(self,
                       results: list[dict[str, Any]],
                       total_time: float
                       ) -> None:
+        """Filters non-matching function entries and stores structured answers
+        inside output JSON path.
         """
-        Filters non-matching function entries
-        and stores structured answers inside output JSON path.
-        """
+        # Filter out invalid or 'none' function calls before writing output.
         all_parsed_result = [r for r in results if r["name"] != "none"]
         os.makedirs(os.path.dirname(self.args.output), exist_ok=True)
         with open(self.args.output, 'w', encoding="utf-8") as f:
@@ -157,8 +174,11 @@ class ConstrainedDecodingApp:
 def main() -> None:
     """Application entrypoint parsing raw command line shell options."""
     console.print("\n[bold purple]=== Program Start ===[/bold purple]\n")
+
+    # Define CLI parser arguments for inputs, outputs, models, and options.
     pars = argparse.ArgumentParser(
-     description="Constrained Decoding Pipeline for Safe JSON Function Calling"
+        description="Constrained Decoding Pipeline for Safe JSON Function "
+                    "Calling"
     )
     pars.add_argument("--input",
                       type=str,
@@ -186,6 +206,7 @@ def main() -> None:
                       help="Maximum tokens to generate the answer"
                       )
 
+    # Initialize app instance and start constrained generation execution.
     app = ConstrainedDecodingApp(pars.parse_args())
     app.execute_pipeline()
 
