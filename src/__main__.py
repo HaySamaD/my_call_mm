@@ -1,220 +1,113 @@
-import os
-import time
-import json
 import argparse
-from typing import Any, cast
-from rich.markup import escape
-from rich.console import Console
+import json
+import numpy as np
 from llm_sdk import Small_LLM_Model
-from src.json_loader import load_function_definitions, load_test_prompts
-from src.constrained_decoding import JsonConstrainedDecoder, load_vocabulary
-
-console = Console()
 
 
-class ConstrainedDecodingApp:
-    """Main orchestration class for loading dependencies and handling the
-    constrained text decoding execution pipeline.
-    """
+def load_json(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-    def __init__(self, args: argparse.Namespace) -> None:
-        """Initializes components, loads schemas, test prompts, and compiles
-        parameters.
-        """
-        # Store CLI arguments and instantiate the language model.
-        self.args = args
-        self.model = Small_LLM_Model(model_name=args.model)
 
-        # Load tool schemas and input prompts from specified files.
-        self.functions = load_function_definitions(args.functions_definition)
-        self.prompts = load_test_prompts(args.input)
-        self.max_tokens = args.max_tokens
+def build_prompt(functions: list[dict], user_prompt: str) -> str:
+    lines = ["Choose ONLY one function name from this list, or 'none':"]
+    for fn in functions:
+        lines.append(f"- {fn['name']}: {fn['description']}")
+    lines.append('Reply ONLY with JSON like: {"name": "fn_name"}')
+    lines.append(f"User prompt: {user_prompt}")
+    lines.append('Assistant: {"name": "')
+    return "\n".join(lines)
 
-        # Ensure essential input files are loaded properly.
-        if not self.functions or not self.prompts:
-            raise RuntimeError("Initialization files are empty or missing.")
 
-        # Build system prompt context for function calling rules.
-        self.system_prompt = JsonConstrainedDecoder.build_system_prompt(
-            self.functions)
+def get_vocab(model: Small_LLM_Model) -> dict[str, int]:
+    path = model.get_path_to_tokenizer_file()
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data.get("model", {}).get("vocab", {})
 
-        # Load tokenizer vocabulary and map valid function names.
-        vocab = load_vocabulary(self.model)
-        valid_names = [fn.name for fn in self.functions]
-        self.decoder = JsonConstrainedDecoder(
-            vocab=vocab, valid_function_names=valid_names)
 
-    def execute_pipeline(self) -> None:
-        """Iterates through the testing prompts and performs state-constrained
-        sampling loops.
-        """
-        console.print("\n[bold yellow]Processing prompts...[/bold yellow]\n")
-        all_results = []
-        start_time = time.time()
+def pick_best_function(
+    model: Small_LLM_Model,
+    vocab: dict[str, int],
+    functions: list[dict],
+    user_prompt: str,
+    max_tokens: int = 15,
+) -> str:
+    allowed_names = [fn["name"] for fn in functions] + ["none"]
+    prompt_text = build_prompt(functions, user_prompt)
 
-        # Iterate over all user test prompts sequentially.
-        for index, p in enumerate(self.prompts, 1):
-            prompt = p.prompt
-            console.print(
-                f"[bold cyan]Processing prompt {index}/{len(self.prompts)}:"
-                f"[/bold cyan] {prompt}")
+    input_ids = model.encode(prompt_text)[0].tolist()
+    chosen_name_chars = ""
 
-            # Construct full context and initialize decoding state with prefix.
-            full_prompt = (
-                f"{self.system_prompt}\n\nUser prompt: {prompt}\nAssistant:")
-            generated_ids = self.model.encode(full_prompt)[0].tolist()
-            all_generated = self.model.encode('{"name": "')[0].tolist()
-            parsed = {"name": "none", "args": {}}
-            token_count = 0
+    for _ in range(max_tokens):
+        logits = np.array(model.get_logits_from_input_ids(input_ids), dtype=np.float32)
 
-            print("  -> Generating: ", end="", flush=True)
-            print('{"name": "', end="", flush=True)
+        valid_ids = []
+        for token_str, token_id in vocab.items():
+            if not token_str or "\n" in token_str or "\r" in token_str:
+                continue
 
-            # Token generation loop with constrained decoding.
-            while True:
-                # Prevent infinite generation loops by enforcing token limits.
-                if token_count >= self.max_tokens:
-                    console.print("\n  -> [bold red][Error] Maximum "
-                                  "token limit reached (Loop safety "
-                                  "break)[/bold red]")
-                    break
+            clean_part = token_str.replace('"', "")
+            candidate = chosen_name_chars + clean_part
 
-                current_text = self.model.decode(all_generated)
-                logits = self.model.get_logits_from_input_ids(
-                    generated_ids + all_generated)
-
-                # Filter logits via FSM decoder to pick valid token ID.
-                next_id = self.decoder.get_approve_valid_token(
-                    logits, current_text)
-                all_generated.append(next_id)
-                token_count += 1
-
-                print(self.model.decode([next_id]), end="", flush=True)
-
-                # Attempt to extract a valid bounded JSON block from stream.
-                text = self.model.decode(all_generated)
-                clean_json = JsonConstrainedDecoder.extract_complete_json(text)
-                if clean_json:
-                    try:
-                        parsed = json.loads(clean_json)
-                        break
-                    except Exception:
-                        pass
-            print()
-
-            # Display status based on parsed function call outcome.
-            if parsed.get("name", "none") != "none":
-                escaped_args = escape(str(parsed['args']))
-                console.print("  -> [bold green]✔ Success:[/bold green] "
-                              f"{parsed['name']}({escaped_args})")
+            if '"' in token_str:
+                if chosen_name_chars in allowed_names:
+                    valid_ids.append(token_id)
             else:
-                console.print("  -> [bold red]❌ [Error] Could not generate "
-                              "function call[/bold red]")
-            print()
+                if any(name.startswith(candidate) for name in allowed_names):
+                    valid_ids.append(token_id)
 
-            # Cast extracted arguments and parse according to schema types.
-            extracted_args = cast(dict[Any, Any], parsed.get("args", {}))
-            cleaned_parameters: dict[str, Any] = {}
+        if valid_ids:
+            masked = np.full_like(logits, -1e9)
+            masked[valid_ids] = logits[valid_ids]
+            next_id = int(np.argmax(masked))
+        else:
+            next_id = int(np.argmax(logits))
 
-            current_fn_def = next((
-                fn for fn in self.functions if fn.name == parsed.get("name")),
-                None)
+        next_piece = model.decode([next_id])
+        input_ids.append(next_id)
 
-            # Validate parameter keys and convert values to expected types.
-            for key, value in extracted_args.items():
-                if current_fn_def and key not in current_fn_def.parameters:
-                    continue
+        if '"' in next_piece:
+            break
+        chosen_name_chars += next_piece
 
-                expected_type = (
-                    current_fn_def.parameters[key].type
-                    if current_fn_def else "string")
-
-                if expected_type == "integer":
-                    try:
-                        cleaned_parameters[key] = int(float(str(value)))
-                    except ValueError:
-                        cleaned_parameters[key] = value
-                elif expected_type == "number":
-                    try:
-                        cleaned_parameters[key] = float(str(value))
-                    except ValueError:
-                        cleaned_parameters[key] = value
-                else:
-                    cleaned_parameters[key] = value
-
-            # Append current prompt evaluation result.
-            all_results.append({
-                "prompt": prompt,
-                "name": parsed.get("name", "none"),
-                "parameters": cleaned_parameters
-            })
-
-        # Save aggregated pipeline execution results to disk.
-        self._save_results(all_results, time.time() - start_time)
-
-    def _save_results(self,
-                      results: list[dict[str, Any]],
-                      total_time: float
-                      ) -> None:
-        """Filters non-matching function entries and stores structured answers
-        inside output JSON path.
-        """
-        # Filter out invalid or 'none' function calls before writing output.
-        all_parsed_result = [r for r in results if r["name"] != "none"]
-        os.makedirs(os.path.dirname(self.args.output), exist_ok=True)
-        with open(self.args.output, 'w', encoding="utf-8") as f:
-            json.dump(all_parsed_result, f, ensure_ascii=False, indent=2)
-
-        console.print("The result is saved in [cyan]"
-                      f"{self.args.output}[/cyan]")
-        console.print("Total time: [bold yellow]"
-                      f"{total_time:.2f}[/bold yellow] seconds\n")
+    final_name = chosen_name_chars.strip().strip('"')
+    return final_name if final_name in allowed_names else "none"
 
 
 def main() -> None:
-    """Application entrypoint parsing raw command line shell options."""
-    console.print("\n[bold purple]=== Program Start ===[/bold purple]\n")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", default="data/input/function_calling_tests.json")
+    parser.add_argument("--functions_definition", default="data/input/functions_definition.json")
+    parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--show", choices=["name", "description"], default="name")
+    parser.add_argument("--max_tokens", type=int, default=15)
+    args = parser.parse_args()
 
-    # Define CLI parser arguments for inputs, outputs, models, and options.
-    pars = argparse.ArgumentParser(
-        description="Constrained Decoding Pipeline for Safe JSON Function "
-                    "Calling"
-    )
-    pars.add_argument("--input",
-                      type=str,
-                      default="data/input/function_calling_tests.json",
-                      help="Path to input test cases."
-                      )
-    pars.add_argument("--functions_definition",
-                      type=str,
-                      default="data/input/functions_definition.json",
-                      help="Path to function schema definition configurations."
-                      )
-    pars.add_argument("--output",
-                      type=str,
-                      default="data/output/function_calling_results.json",
-                      help="Path to dump schema valid evaluations."
-                      )
-    pars.add_argument("--model",
-                      type=str,
-                      default="Qwen/Qwen3-0.6B",
-                      help="Local path or Hugging Face Hub tracking name tag."
-                      )
-    pars.add_argument("--max_tokens",
-                      type=int,
-                      default=50,
-                      help="Maximum tokens to generate the answer"
-                      )
+    model = Small_LLM_Model(model_name=args.model)
+    vocab = get_vocab(model)
+    functions = load_json(args.functions_definition)
+    tests = load_json(args.input)
 
-    # Initialize app instance and start constrained generation execution.
-    app = ConstrainedDecodingApp(pars.parse_args())
-    app.execute_pipeline()
+    desc_map = {fn["name"]: fn["description"] for fn in functions}
+
+    for item in tests:
+        user_prompt = item["prompt"] if isinstance(item, dict) else str(item)
+        fn_name = pick_best_function(
+            model=model,
+            vocab=vocab,
+            functions=functions,
+            user_prompt=user_prompt,
+            max_tokens=args.max_tokens,
+        )
+
+        if args.show == "name":
+            result = fn_name
+        else:
+            result = desc_map.get(fn_name, "No matching function")
+
+        print(f"{user_prompt} -> {result}")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nProgram Stopped.")
-    except Exception as e:
-        print(f"Error: {e}")
+    main()
